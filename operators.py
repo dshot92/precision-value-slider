@@ -89,7 +89,6 @@ class PVS_OT_slide(Operator):
         self._base_raw = original_raw               # the same value in stored units (exact)
         self._anchor_x = start_x                    # where horizontal measurement starts
         self._anchor_y = start_y                    # where vertical precision measurement starts
-        self._anchor_exponent = 0                   # step at the vertical anchor
         self._ticks = 0
         self._axis_x = start_x                      # last position along the active axis
         self._axis_y = start_y
@@ -100,9 +99,19 @@ class PVS_OT_slide(Operator):
         self._speed = 0.0                           # window pixels per second, smoothed
 
         # The ladder is always centred on the unit step, never on the value's own
-        # precision; the preference adds N coarser and N finer steps around it.
+        # precision; the preference adds N coarser and N finer steps around it. Every
+        # row is shown at every value. A step finer than the field can store is not
+        # turned into another amount: the drag accumulates the exact step and the field
+        # takes the nearest value it can hold, so a long enough drag still moves.
         span = ladder_rows(context)
         low, high = exponent_range(self._field.is_int, span)
+        # Start on a row whose single tick changes the stored value, so the first tick
+        # of a drag visibly moves. The finer rows stay visible, and a coarser row is
+        # added if the usable one is above the preference's range (a billion needs a
+        # million).
+        usable = max(low, self._field.finest_step_exponent())
+        high = max(high, usable)
+        self._anchor_exponent = clamp_exponent(0, usable, high)  # step at the vertical anchor
         avoid = regions.avoid_rect(region, ladder_height(low, high))
         x, y = ladder_center(start_x, start_y, low, high, self._anchor_exponent)
         self._state = LadderState(
@@ -274,12 +283,18 @@ class PVS_OT_slide(Operator):
             return
         self._ticks = ticks
         step = step_for_exponent(self._state.exponent)
-        value = slide_value(self._base, step, ticks)
+        # The exact value is always the anchor plus whole steps, even when the step is
+        # finer than the field can store. The field keeps the nearest value it can hold,
+        # and the accumulated offset is never rounded away: at 5 million a float32 is
+        # 0.5 apart, so a .0001 step only changes the stored value after enough ticks,
+        # but it changes by the field's own resolution rather than by a wrong amount on
+        # every tick. This is how Blender's own number drag behaves.
+        value = slide_value(self._base, step, ticks, self._field.double)
         if value is None:
             self._field.write_raw(self._base_raw)  # back at the anchor: exactly as it was
         else:
             self._field.write(value)
-        self._expected_all = self._field.raw_values()  # read back: includes clamping / float32
+        self._expected_all = self._field.raw_values()  # read back: includes float32 rounding
         self._refresh_text()
         self._redraw(context)
 

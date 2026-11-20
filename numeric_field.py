@@ -4,10 +4,11 @@
 
 import math
 import re
-import struct
 from decimal import Decimal
 
 import bpy
+
+from .ladder import stored_text
 
 
 def _parse_property_tuple(prop_tuple) -> tuple:
@@ -80,10 +81,15 @@ class NumericField:
         if isinstance(sample, bool) or not isinstance(sample, (int, float)):
             raise ValueError('Not a numeric field')
         self.is_int = isinstance(sample, int)
-        self.precision = self._custom_precision()
+        # Python floats are doubles, but Blender's own ID properties (Geometry Nodes
+        # inputs, for one) are 32 bit. The width must be known to format the value and
+        # to pick steps it can actually store.
+        self.double = False if self.is_int else self._custom_is_double(max(0, index), sample)
+        settings = self._custom_settings()
+        self.precision = 0 if self.is_int else int(settings.get('precision', 3))
 
     def _describe_rna(self, context, index: int) -> None:
-        """Take type, precision and units from the property's own RNA description."""
+        """Take type, precision and units from the property's own description."""
         prop = self.pointer.bl_rna.properties.get(self.name)
         if prop is None or prop.type not in {'FLOAT', 'INT'}:
             raise ValueError('Not a numeric field')
@@ -91,6 +97,7 @@ class NumericField:
             raise ValueError('The field is read-only')
         self.array = prop.is_array
         self.is_int = prop.type == 'INT'
+        self.double = False  # RNA floats are 32 bit
         precision = getattr(prop, 'precision', 3)
         self.precision = 0 if self.is_int else (3 if precision is None else int(precision))
         self.unit = getattr(prop, 'unit', 'NONE') or 'NONE'
@@ -99,14 +106,39 @@ class NumericField:
         self.rotation = rotation and mode == 'DEGREES'
         self.radians = rotation and mode == 'RADIANS'
 
-    def _custom_precision(self) -> int:
-        """Decimals Blender uses for this custom property (its own field precision)."""
-        if self.is_int:
-            return 0
+    def _custom_settings(self) -> dict:
+        """UI metadata Blender keeps for a custom property (its own precision)."""
         try:
-            return int(self.pointer.id_properties_ui(self.name).as_dict().get('precision', 3))
+            return self.pointer.id_properties_ui(self.name).as_dict()
         except (AttributeError, TypeError, ValueError, RuntimeError):
-            return 3  # custom properties on non-ID structs (node sockets) keep the default
+            return {}  # custom properties on non-ID structs (node sockets) keep defaults
+
+    def _custom_is_double(self, index: int, sample: float) -> bool:
+        """Whether this ID property keeps 64 bit floats, probed without leaving a trace.
+
+        Python's custom properties are doubles, but Blender's own (a Geometry Nodes
+        modifier input, for one) are 32 bit, and the IDProperty width is not exposed to
+        Python. A tenth of a float32 ulp is far above a double's ulp at the same value:
+        a double keeps the change, a float rounds it away. The original value is put
+        back before returning.
+        """
+        if not math.isfinite(sample):
+            return True
+        step = _float_gap(sample, 24) * .1
+        probe = sample + step if sample == 0.0 else sample - math.copysign(step, sample)
+        try:
+            if self.array:
+                array = self.pointer[self.name]
+                array[index] = probe
+                changed = array[index] != sample
+                array[index] = sample
+            else:
+                self.pointer[self.name] = probe
+                changed = self.pointer[self.name] != sample
+                self.pointer[self.name] = sample
+        except (AttributeError, TypeError, ValueError, RuntimeError, KeyError):
+            return True  # unreadable or read-only: leave the wider assumption
+        return changed
 
     # ---- storage ----------------------------------------------------------------
 
@@ -138,6 +170,42 @@ class NumericField:
         value = self.raw()
         return math.degrees(value) if self.rotation else value
 
+    def finest_step_exponent(self) -> int:
+        """Finest power of ten that changes the stored value in a single tick.
+
+        One ulp of the stored float, in display units, rounded up to a power of ten:
+        at 5.6 million a float32 is 0.5 apart, so a .1 step does not change the value
+        on its own. The row still appears in the ladder and the slide accumulates the
+        exact step, so a long enough drag moves the stored value; this value only picks
+        the row a drag opens on. Above 16.7 million the gap is a whole number, and a
+        step must also be a multiple of it: with a gap of 8, a 10 step lands on 8 or 16,
+        not 10. The same resolution rounds a rotation's degrees before printing them,
+        since the value is stored in radians and converting back adds noise (45 degrees
+        reads as 45.0000017).
+        """
+        if self.is_int:
+            return 0
+        value = self.display()
+        if value == 0.0 or not math.isfinite(value):
+            return -323  # no magnitude: every step the ladder shows is representable
+        if self.rotation:  # ulp of the stored radians, then back to displayed degrees
+            value = math.radians(value)
+        # float32 has a 24 bit significand, float64 a 53 bit one.
+        ulp = _float_gap(value, 53 if self.double else 24)
+        if self.rotation:
+            ulp = math.degrees(ulp)
+        result = math.ceil(math.log10(ulp))
+        # log10 can land on the wrong side of an exact power; compare the step itself.
+        step = Decimal(10) ** result
+        if step < Decimal(ulp):
+            result += 1
+        elif Decimal(10) ** (result - 1) >= Decimal(ulp):
+            result -= 1
+        if not self.rotation and ulp >= 1:
+            # ulp is 2**e here: a whole-number step must be a multiple of it.
+            result = max(result, math.frexp(ulp)[1] - 1)
+        return result
+
     def text(self, decimals: int = 0) -> str:
         """Value text for the ladder: the value's own digits, padded to the selected step.
 
@@ -151,15 +219,30 @@ class NumericField:
             return str(int(value))
         if not math.isfinite(value):
             return str(value)
-        wanted = max(decimals, _value_decimals(value))
+        display = self.display() + 0.0
+        if self.rotation and math.isfinite(display):
+            # A rotation is stored in radians but shown in degrees, and converting the
+            # float32 radians back adds noise (an exact 45 degrees reads 45.000001).
+            # Round at the field's real resolution so only meaningful digits remain.
+            digits = max(0, min(9, -self.finest_step_exponent()))
+            display = round(display, digits)
+            value = math.radians(display)
+        wanted = max(decimals, _value_decimals(display, self.double))
         if self.unit != 'NONE':
             start = max(0, min(6, self.precision))
-            text = self._unit_text(value, start)
+            step = 10.0 ** -decimals if decimals > 0 else 1.0
+            # The step is in display units (degrees for rotations), the stored value
+            # is not, so the probe below must move by the step in stored units.
+            step = math.radians(step) if self.rotation else step
             # Ask Blender's formatter for more digits while it still hides some of them.
-            for precision in range(start + 1, 7):
-                if _decimals(text) >= wanted:
-                    break
+            # It also scales the value (a metre becomes a kilometre), which can hide a
+            # whole step: at -13 520 km a one-metre step only shows with enough
+            # decimals, so keep going until the step changes the text too.
+            for precision in range(start, 18):
                 text = self._unit_text(value, precision)
+                if (_decimals(text) >= wanted
+                        and self._unit_text(value + step, precision) != text):
+                    break
             return text
         return f'{value:.{max(0, min(9, wanted))}f}'
 
@@ -188,7 +271,11 @@ class NumericField:
         self._tag_owner()
 
     def write(self, display_value: float) -> None:
-        """Store a value given in display units (degrees for rotations)."""
+        """Store a value given in display units (degrees for rotations).
+
+        No soft or hard range is enforced: the slide writes what the user dragged to,
+        just as typing a value does, so a field may move past its own limits.
+        """
         value = math.radians(display_value) if self.rotation else display_value
         if self.is_int:
             value = int(round(value))
@@ -239,6 +326,17 @@ class NumericField:
 # ---- number formatting helpers ---------------------------------------------------
 
 
+def _float_gap(value: float, bits: int) -> float:
+    """Distance between adjacent floats with ``bits`` significand bits, at ``value``."""
+    smallest = -149 if bits == 24 else -1074
+    if value == 0.0:
+        return math.ldexp(1.0, smallest)
+    exponent = math.frexp(abs(value))[1]
+    if exponent < (-126 if bits == 24 else -1022):
+        return math.ldexp(1.0, smallest)  # subnormal: the gap is constant
+    return math.ldexp(1.0, exponent - bits)
+
+
 def _integer_digits(value: float) -> int:
     """Digits before the decimal point, counted the way Blender's unit formatter counts."""
     value = abs(value)
@@ -251,21 +349,11 @@ def _decimals(text: str) -> int:
     return len(match[1]) if match else 0
 
 
-def _value_decimals(value: float) -> int:
+def _value_decimals(value: float, double: bool = False) -> int:
     """Decimals the value really needs: 1.0001 -> 4, 1.1000 -> 1, 84.0795 -> 4.
 
-    Blender stores floats as 32 bit, so the shortest text that round-trips through
-    ``float32`` is the value the user sees; reading the float64 back would expose
-    noise (84.07949829...).
+    The value is read as the shortest text that round-trips through its storage width,
+    so a 32 bit float's binary digits (84.07949829...) never become decimals of their
+    own.
     """
-    try:
-        bits = struct.pack('<f', value)
-    except (OverflowError, struct.error):
-        return 0
-    text = f'{value:.9g}'
-    for digits in range(1, 10):
-        candidate = f'{value:.{digits}g}'
-        if struct.pack('<f', float(candidate)) == bits:
-            text = candidate
-            break
-    return max(0, -Decimal(text).as_tuple().exponent)
+    return max(0, -Decimal(stored_text(value, double)).as_tuple().exponent)
