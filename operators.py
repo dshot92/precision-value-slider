@@ -140,12 +140,19 @@ class PVS_OT_slide(Operator):
         self._timer = context.window_manager.event_timer_add(.1, window=window)
         self._window = window
         self._cursor_start = (start_x, start_y)
+        self._sliding = True
         self._cursor_hidden = False
-        try:
-            window.cursor_modal_set('NONE')
-            self._cursor_hidden = True
-        except (AttributeError, TypeError, RuntimeError):
-            pass
+        self._hide_cursor()
+        # Blender < 5.1 gives the hovered field's "move X" cursor through the modal
+        # cursor slot and only exits that hover after this operator starts, which
+        # shows the pointer again (5.1 checks `WM_cursor_modal_is_set_ok()` and leaves
+        # a running modal operator's cursor alone). A timer runs after the event
+        # handlers and before drawing, so it re-hides the pointer in the same frame
+        # instead of leaving it visible until the next modal event.
+        self._hide_timer = None
+        if self._cursor_hidden and bpy.app.version < (5, 1, 0):
+            self._hide_timer = self._rehide_cursor
+            bpy.app.timers.register(self._hide_timer, first_interval=0.0)
         context.window_manager.modal_handler_add(self)
         self._redraw(context)  # the ladder may cover several areas, not just one
         return {'RUNNING_MODAL'}
@@ -302,8 +309,35 @@ class PVS_OT_slide(Operator):
         except _SLIDE_ERRORS:
             pass
 
+    def _hide_cursor(self) -> bool:
+        """Hide the pointer for the slide, remembering whether that worked."""
+        try:
+            self._window.cursor_modal_set('NONE')
+        except (AttributeError, ReferenceError, TypeError, RuntimeError):
+            self._cursor_hidden = False
+        else:
+            self._cursor_hidden = True
+        return self._cursor_hidden
+
+    def _rehide_cursor(self) -> float | None:
+        """Stay hidden where the hovered field keeps showing the pointer again.
+
+        Only registered on Blender < 5.1: the hovered number field sets its "move X"
+        cursor through the modal cursor slot there, so hiding once does not stick.
+        Returning ``0.0`` asks for another call on the next main loop iteration.
+        """
+        if not self._sliding or not self._hide_cursor():
+            return None
+        return 0.0
+
     def _cleanup(self, context) -> None:
         """Remove the draw handlers and timer and refresh the screen. Safe to call twice."""
+        if getattr(self, '_sliding', False):
+            self._sliding = False
+            hide_timer = getattr(self, '_hide_timer', None)
+            self._hide_timer = None
+            if hide_timer is not None and bpy.app.timers.is_registered(hide_timer):
+                bpy.app.timers.unregister(hide_timer)
         if getattr(self, '_cursor_hidden', False):
             try:
                 self._window.cursor_modal_restore()
