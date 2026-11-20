@@ -176,6 +176,9 @@ def panel_size(state: LadderState) -> tuple[float, float]:
     blf.size(0, base)
     label_w = max(blf.dimensions(0, f'‹  {text}  ›')[0] for text in labels.values())
     value_w = blf.dimensions(0, state.value_text)[0]
+    if not state.value_text.startswith('-'):
+        # Keep a sign column even while positive: crossing zero must not resize the panel.
+        value_w += blf.dimensions(0, '-')[0]
     # Quantised to whole font sizes so the panel does not resize on every digit.
     width = math.ceil(max(label_w, value_w, base * 5) / base) * base + pad * 2
     height = len(labels) * row_height() + pad * 2
