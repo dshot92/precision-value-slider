@@ -1,0 +1,26 @@
+schema_version = "1.0.0"
+
+id = "precision_value_slider"
+name = "Precision Value Slider"
+version = "0.1.1"
+tagline = "Precision sliders for values"
+maintainer = "Daniele Stochino <dshot92@gmail.com>"
+type = "add-on"
+
+# Optional list defined by Blender and server, see:
+# https://docs.blender.org/manual/en/dev/advanced/extensions/tags.html
+tags = ["User Interface"]
+
+# Optional: maximum supported Blender version
+# blender_version_max = "5.1.0"
+blender_version_min = "4.2.0"
+
+# License conforming to https://spdx.org/licenses/ (use "SPDX: prefix)
+# https://docs.blender.org/manual/en/dev/extensions/licenses.html
+license = ["SPDX:GPL-3.0-or-later"]
+
+# Optional link to documentation, support, source files, etc
+website = "https://github.com/dshot92/precision-value-slider"
+
+# Optional: required by some licenses.
+copyright = ["2026 Daniele Stochino"]
