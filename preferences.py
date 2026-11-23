@@ -8,7 +8,7 @@ import bpy
 from bpy.props import FloatProperty, IntProperty
 from bpy.types import AddonPreferences
 
-DEFAULT_LADDER_ROWS = 4
+DEFAULT_LADDER_ROWS = 3
 DEFAULT_PIXELS_PER_STEP = 10.0
 
 
