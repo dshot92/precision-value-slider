@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 id = "precision_value_slider"
 name = "Precision Value Slider"
-version = "0.1.1"
+version = "0.1.0"
 tagline = "Precision sliders for values"
 maintainer = "Daniele Stochino <dshot92@gmail.com>"
 type = "add-on"
